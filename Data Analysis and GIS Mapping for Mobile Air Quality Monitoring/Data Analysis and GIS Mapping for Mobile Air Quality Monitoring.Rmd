@@ -1,0 +1,721 @@
+---
+title: "Data Analysis and GIS Mapping for Mobile Air Quality Monitoring"
+author: "Xiaoman Zhang"
+date: "2024-02-28"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup}
+knitr::opts_chunk$set(message = FALSE, error = FALSE)
+# Libraries needed
+# For data processing and analysis
+library(lubridate)
+library(rlang)
+library(ggpubr)
+library(geosphere)
+library(MASS)
+library(dplyr) # dplyr must go after MASS, ow select will be masked.
+library(tidyr)
+
+# For plotting
+library(ggplot2)
+library(unikn)
+library(scico)
+library(ggmap)
+library(rstudioapi)
+library(terra)
+
+```
+
+# 1. Background & Objectives
+
+The McKinley Park neighborhood, a diverse and working-class community on the southwest side of Chicago, experienced a significant change in 2008 with the arrival of MAT Asphalt, the city's largest asphalt factory. Residents soon reported sulfur and ammonia-like odors emanating from the factory, adversely affecting their quality of life. In response, the community established Neighbors For Environmental Justice (N4EJ), a non-profit organization, and succeeded in deploying seven real-time particulate matter (PM) sensors throughout the area. Data revealed that PM levels near the asphalt plant were consistently higher than those in other parts of the community. However, given the presence of other PM sources, such as railyards and highways, the PM data alone cannot isolate the asphalt plant's contributions to local air pollution. Moreover, particulate matters are odorless, and asphalt plants are known to emit various other pollutants (such as SO2, volatile organic compounds including benzene, toluene, ethylbenzene, xylene, and nitrogen oxides) that contribute to the unpleasant odors. 
+
+Therefore, we began this air monitoring project which aims **not only to trace the sources of pollutants but also to measure a range of pollutants beyond PMs**. To get a detailed look of air quality in the neighborhood, we chose a mobile monitoring (in-motion measurements by vehicle-mounted instruments) approach, which can provide higher spatial-resolution air pollution concentration data to rule out the impact of transportation and industrial emissions in neighboring communities. We have developed a mobile monitoring system using all-electric vehicle (EV) with GPS device and two air analyzers, Gasmet DX4040 FTIR Gas Analyzer and DustTrak II Aerosol Monitor 8530, which together can measure a wide range of chemicals and PMs. This R document record how we process and analysis two initial data we got.
+
+# 2. Data processing
+## 2.1 Import and prepare GPS and DX4040 data
+```{r}
+# 1. import dx4040 data
+## dx4040 took measurement every 7-9s (the variation is due to the 2-4s analysis time)
+dx<-read.csv("240221_dx_ori.csv")
+
+# Remove unneeded cols
+# head(dx)
+dx <- dx %>% select(- starts_with("Unit"), - starts_with("Compensation"),-starts_with("Residual"),-Line,-Date,-SpectrumFile,-LibraryFile,-Cell.temperature,-Status)
+
+# prepare dx4040 data: convert Time from character to POSIXct objects
+date <- "2024-02-21"
+dx$Time <- ymd_hms(paste(date, dx$Time),tz="America/Chicago")
+# other option:
+# dx$Time <- as.POSIXct(paste(date, dx$Time), format="%Y-%m-%d %H:%M:%S", tz="America/Chicago")
+dx$Time <- round_date(dx$Time, unit = "second")
+
+rm(date)
+# head(dx)
+# sapply(dx,class)
+# summary(dx)
+
+#2. import gps data
+## Most gps data has an interval about 1s.
+## The gps will not record the time point when the distance traveled during an interval is less than 1m
+gps_1<-read.csv("240221_gps_1.csv")
+gps_2<-read.csv("240221_gps_2.csv")
+gps <- rbind(gps_1,gps_2)
+# head(gps)
+
+# Prepare gps data
+gps<- gps %>% select(Date.Local., Latitude, Longitude)
+names(gps)[1]<-"Time"
+gps$Time <- ymd_hms(as.character(gps$Time),tz="America/Chicago")
+gps$Time <- round_date(gps$Time, unit = "second")
+
+# Check for duplicates: There might be duplicates after round_date() 
+duplicates1 <- duplicated(gps$Time) | duplicated(gps$Time, fromLast = TRUE)
+table(duplicates1)
+table(gps$Time[duplicates1]) #2024-02-21 17:28:32
+
+# remove the duplicated time point by taking the average of the lat and lon
+gps_dedu <- gps %>%
+  group_by(Time) %>%
+  summarise(across(.cols = where(is.numeric), ~mean(.x, na.rm = TRUE)))
+
+# double check
+# duplicates2 <- duplicated(gps_dedu$Time) | duplicated(gps_dedu$Time, fromLast = TRUE)
+# table(duplicates2)
+# table(gps_dedu$Time[duplicates2])
+# 
+# gps[gps$Time=="2024-02-21 17:28:32",]
+# gps_dedu[gps_dedu$Time=="2024-02-21 1:28:32",]
+
+# Change the format
+gps <- gps_dedu %>%
+  mutate(Latitude = sprintf("%.6f", Latitude),
+         Longitude = sprintf("%.6f", Longitude))
+
+rm(duplicates1,duplicates2)
+rm(gps_1,gps_2,gps_dedu)
+```
+
+## 2.2 Link gps data with dx4040 data by time
+DX4040 and the gps device we used take measurement at different frequency. Most gps data points has an interval about 1s. However, when the distance traveled during an interval is less than 1m, the gps will not record the second time point. DX4040 data have a wider time interval than GPS, which is 7-9s. There is a 2s variation due the variation in the device's analysis time. 
+To link the two dataframes, I first created gps_filled, where the gps data is in 1s interval. I filled the empty longitude and latitude cells by copying each one's nearest upper cell, as the GPS stops recording when the distance traveled during a time interval is less than 1m. Then, I calculated the latitude and longitude of each dx data point by taking the average of their corresponding latitudes and longitudes (those in the same time interval) in gps_filled. Before taking the average, I checked the boundries (the start, the end, and the gap ) to make sure they are in the right structure for the following code. There is a gap in both dataframes as we stopped taking measurements during the lunch break.
+
+```{r data_linkage }
+# 1. Create gps_filled: 1s interval gps data 
+gps$Time %>% summary
+dx$Time %>% summary
+
+time_seq <- seq(from = min(gps$Time), to = max(gps$Time), by = "sec")
+new_df <- data.frame(Time = time_seq)
+
+gps_filled <- new_df %>%
+  left_join(gps, by="Time") %>%
+  fill(everything()) # fill() fills values downwards by default
+
+# Double-check
+# tail(gps)
+# ## check filling part
+# gps_filled[gps_filled$Time=="2024-02-21 17:26:58",]
+# gps_filled[gps_filled$Time=="2024-02-21 17:27:16",]
+# gps_filled[28244:28263,]
+
+rm(time_seq,new_df)
+
+# 2. create df dx_gps
+dx_gps <- dx
+# add 2 empty col
+dx_gps["latitude"] <- NA
+dx_gps["longitude"] <- NA
+# rearrange the col
+dx_gps <- dx_gps[c(1, (ncol(dx_gps) - 1), ncol(dx_gps), 2:(ncol(dx_gps) - 2))]
+dx_gps[1,c(1:5,ncol(dx_gps)-1,ncol(dx_gps))]
+
+
+# 3. check the boundary
+## 3.1 the Start: gps start early, no need to change things
+
+# ## if dx starts earlier, delete the part with no gps data
+# gps_filled[1,1] #"2024-01-31 10:56:36 CST"
+# min(which(dx_gps$Time>="2024-01-31 10:56:36 CST"))
+# dx_gps[102,1] # "2024-01-31 10:56:38 CST"
+# dx_gps_d <- dx_gps[-(1:102),]
+# ## check
+# dx_gps_d[1:5,1:5]
+# dx_gps[102:107,1:5]
+# dx_gps <- dx_gps_d
+# rm(dx_gps_d)
+
+## 3.2 the End gps ends later, no need to change things
+# ## the end: delet the dx data ends after the ending of gps 
+# dx_gps[nrow(dx_gps),1]
+# gps_filled[nrow(gps_filled),1]
+# which(dx_gps$Time>="2024-01-31 14:17:52 CST")
+# dx_gps[911:913,1]
+# dx_gps<-dx_gps[-(914:922),]
+
+## 3.3 the gap
+# the gap in gps data
+which(gps_filled$Time=="2024-02-21 12:39:23") #10990
+which(gps_filled$Time=="2024-02-21 13:32:54") #14201
+which(gps$Time=="2024-02-21 12:39:23") #5941
+gps$Time[5941:5942]
+
+# the gap in dx is between 1407 and 1408
+which(dx_gps$Time>"2024-02-21 13:32:54")[1] 
+dx_gps$Time[1407:1408]
+# "2024-02-21 12:37:40 CST" # 1407
+# "2024-02-21 13:35:17 CST" # 1408
+
+## 3.4 find the average time interval between datapoints in dx
+time_dif <- diff(dx_gps$Time)
+time_dif <- as.numeric(time_dif)
+hist(time_dif)
+time_dif[1407] 
+time_dif <- time_dif[-1407]
+summary(time_dif) # mean = 7.67, median=8
+hist(time_dif)
+
+# which(dx_gps$Time<="2024-01-31 13:04:03 CST" & dx_gps$Time>="2024-01-31 13:01:38 CST",)
+# which(gps_filled$Time=="2024-01-31 13:04:03 CST")
+# dx_gps[358:360,1]
+# dx_gps_d <- dx_gps[-(340:360),]
+# dx_gps[339:361,1]
+# dx_gps_d[339:340,1]
+# dx_gps <- dx_gps_d
+# rm(dx_gps_d)
+
+# 4. calculate the average latitudes and longitudes
+gps_filled$Latitude <- as.numeric(gps_filled$Latitude)
+gps_filled$Longitude <- as.numeric(gps_filled$Longitude)
+
+for (i in 2:nrow(dx_gps)){
+  if (i != 1408) { # 1480 is the end of the gap
+    # print(i)
+    dis = dx_gps[i,1]-dx_gps[i-1,1]
+    in_end = which(gps_filled$Time==dx_gps[i,1])
+    in_start = in_end - dis + 1
+    dx_gps[i,2] = mean(gps_filled$Latitude[in_start:in_end])
+    dx_gps[i,3] = mean(gps_filled$Longitude[in_start:in_end])
+  }
+  else {
+    dis = 8 # average time interval between data points in dx
+    in_end = which(gps_filled$Time==dx_gps[i,1])
+    in_start = in_end - dis + 1
+    dx_gps[i,2] = mean(gps_filled$Latitude[in_start:in_end])
+    dx_gps[i,3] = mean(gps_filled$Longitude[in_start:in_end])
+  }
+}
+
+# Double check
+# dx_gps[2946:2947,1:3]
+# gps_filled[gps_filled$Time=="2024-02-21 16:51:51",1:3] 
+# gps_filled[26131:26138,1:3] %>% summarise(mean(Latitude),mean(Longitude))
+# dx_gps[2947,2:3]
+
+
+```
+
+## 2.3 Remove usual or unrelated measurments
+The first few measurements of DX4040 can be unstable, therefore here those unstable measurements are deleted.
+```{r}
+#remove the first few lines when CO2, water and methane were not stable
+dx_gps[1:30,] %>% select(Time,Carbon.dioxide,Water.vapor, Methane)
+dx_gps <- dx_gps[-(1:8),]
+
+# check the gap
+which(dx_gps$Time == "2024-02-21 13:35:17") #1400
+dx_gps[1390:1410,] %>% select(Time,Carbon.dioxide,Water.vapor, Methane)
+
+# obs with strange figures on Carbon.dioxide, Water.vapor, and Methane
+dx_gps %>% select(Carbon.dioxide, Water.vapor, Methane) %>% summary()
+hist(dx_gps$Carbon.dioxide)
+hist(dx_gps$Water.vapor)
+hist(dx_gps$Methane)
+
+# Check outliers
+dx_gps %>%
+  filter(Carbon.dioxide <= 400 | 
+           Water.vapor < 0.4  |
+           Methane < 1.5 | Methane > 2.5) %>%
+  select(Time,Carbon.dioxide,Water.vapor, Methane)
+# 2 outlier
+# Time Carbon.dioxide Water.vapor Methane
+# 1 2024-02-21 11:53:07         446.78        0.65    2.79
+# 2 2024-02-21 11:53:14         444.59        0.65    2.78
+
+# # which chemicals have all 0 obs: Nitrogen.monoxide Benzene
+# which(apply(dx_gps, 2, function(x) all(x == 0)))
+# dx_gps[1:5,c(5,13)]
+
+# Delete the part data collected on the way to the factory (not in the neighborhood)
+which(dx_gps$latitude>41.84)
+dx_gps_r <- dx_gps[-(1:120),]
+
+```
+
+
+# 3. Data visualization 
+## 3.1 Plot one chemical -- P.Xylene
+```{r plot_one}
+
+# 1. Prepare  the palette for plotting
+mypal1=scico(20,alpha=0.8,direction=1,palette="vik")
+# unikn::seecol(mypal1)
+
+# 2. Limit of CRS
+xmin <- min(dx_gps_r$longitude)
+xmax <- max(dx_gps_r$longitude)
+ymin <- min(dx_gps_r$latitude)
+ymax <- max(dx_gps_r$latitude)
+
+# 3. Download google map in the neighborhood
+# library(ggmap)
+# library(rstudioapi)
+# 
+# ## MAT asphalt: 41.82322209888623, -87.67705788465723
+# register_google(key="************************")
+# MAT_as.14 <- ggmap (get_googlemap(center=c(lon=-87.677, lat=41.8232),
+#                                zoom = 14,
+#                                maptype = 'terrain',
+#                                color = 'color'))
+# save(MAT_as.14, file = "MAT_as.14.RData")
+load("MAT_as.14.RData")
+
+# 4. Check the point plot of P.Xylene
+P.Xylene_pp <- MAT_as.14 +
+  geom_point(data=dx_gps_r,aes(x=longitude, y=latitude, color=P.Xylene)) +
+  scale_colour_gradientn(colors=mypal1,name= "P-Xylene") +
+  coord_sf(xlim=c(xmin-0.003,xmax+0.003), ylim=c(ymin-0.003,ymax+0.003))
+P.Xylene_pp
+
+# 5. Plot the raster plot of P.Xylene
+## Convert df to SpatVector
+r_svec <- vect(dx_gps_r,geom=c("longitude", "latitude"), crs="+proj=longlat +datum=WGS84")
+## Create a rast tem with defining extent and resolution
+rast_tem <- rast(xmin=xmin-0.005, xmax=xmax+0.005, ymin=ymin-0.005, ymax=ymax+0.005, res=0.0005)
+## rasterize the data
+P.Xylene_rast <- rasterize(r_svec, rast_tem, field='P.Xylene', fun=mean)
+# plot(P.Xylene_rast)
+P.Xylene_df <- as.data.frame(P.Xylene_rast, xy=T, na.rm=TRUE)
+
+## Plot the raster plot of P.Xylene
+P.Xylene_rp <- MAT_as.14 + 
+  geom_tile(data = P.Xylene_df, aes(x = x, y = y, fill = mean), alpha = 0.9) +
+  scale_fill_gradientn(colors=mypal1,name= "P-Xylene") +
+  coord_sf(xlim=c(xmin-0.003,xmax+0.003), ylim=c(ymin-0.003,ymax+0.003))
+P.Xylene_rp
+
+```
+
+## 3.2 Plot all chemicals
+```{r eval=FALSE}
+# Rasterize all components in dx_gps_r
+rast.plot_list <- list()
+
+for (col_name in colnames(dx_gps_r)[4:ncol(dx_gps_r)]){
+  col_rast <- rasterize(r_svec, rast_tem, field=col_name, fun=mean)
+  col_df <- as.data.frame(col_rast, xy=T, na.rm=TRUE)
+  rast_val_vec <- col_df[,3]
+  
+  plot_name <- paste0(col_name, "_merged")
+  rast.plot_list[[plot_name]] <- MAT_as.14 + 
+    geom_tile(data = col_df, aes(x = x, y = y, fill = mean), alpha = 0.9) +
+    scale_fill_gradientn(colors=mypal1,name= col_name) +
+    coord_sf(xlim=c(xmin-0.003,xmax+0.003), ylim=c(ymin-0.003,ymax+0.003))
+}
+
+# store in a pdf
+pdf("./24021_MAT_plots.pdf", width = 10, height = 8)
+for (i in rast.plot_list) {
+  print(i)
+}
+dev.off()
+```
+
+# 4. Data analysis
+## 4.1 Get the raterized means of all the chemicals
+The rasterized means are used for following analysis instead of the original data points, because the latter is unevenly distributed and thus can introduce bias.
+
+```{r}
+# create an empty df - rast_mean to store the mean val on the rasterized plot
+rast_mean <- data.frame(matrix(NA, nrow = nrow(P.Xylene_df), ncol = ncol(dx_gps_r) - 1))
+names(rast_mean) <- names(dx_gps_r)[2:ncol(dx_gps_r)]
+rast_mean$longitude <- P.Xylene_df$x
+rast_mean$latitude <- P.Xylene_df$y
+
+# Get the rasterized means
+r_svec <- vect(dx_gps_r,geom=c("longitude", "latitude"), crs="+proj=longlat +datum=WGS84")
+rast_tem <- rast(xmin=xmin-0.005, xmax=xmax+0.005, ymin=ymin-0.005, ymax=ymax+0.005, res=0.0005)
+
+for (col_name in colnames(dx_gps_r)[4:ncol(dx_gps_r)]){
+  col_rast <- rasterize(r_svec, rast_tem, field=col_name, fun=mean)
+  col_df <- as.data.frame(col_rast, xy=T, na.rm=TRUE)
+  index <- match(col_name, names(rast_mean))
+  if (!is.na(index)) {
+    rast_mean[[index]] <- col_df[[3]]
+  }
+}
+   
+```
+
+## 4.2 Compare two datasets: factory operating vs. factory not operating
+The data set processed above was taken on Feb 21, 2024, when the factory was not operating. We also have another data set taken when the factory was operating (on Nov 30,2023). Here I did two sample t-test and Wilcoxon rank sum tests on them. The data set collected on Nov 2023 covers a smaller area in the neighborhood, as that is our first trip and was mainly to test all the devices. To ensure that it's a more equivalent comparison, I retrained a same boundary box for both data sets before comparison. 
+
+### 4.2.1 Prepare two datasets to be compared
+```{r}
+rast_mean_2402 <- rast_mean
+
+## make sure the 2 rast_mean dfs have the same col names and structure
+###  Exclude the "Benzene" column, as the df to be compared with dosen't have Benzene col
+rast_mean_2402 <- rast_mean %>% 
+  select(-Benzene)
+
+## Import 
+rast_mean_2311 <- read.csv("231130_rast_mean.csv")
+
+### remove the index col and change the name of lat and lon
+rast_mean_2311 <- rast_mean_2311 %>%
+  select(-1) %>%
+  rename(latitude=Latitude, longitude=Longitude)
+
+## restrain a bbox for both
+lon_min <- -87.6847
+lon_max <- -87.6654
+lat_min <- 41.8229
+lat_max <- 41.8306
+
+rast_mean_2311_r <- rast_mean_2311 %>%
+  filter(latitude>=lat_min & latitude<=lat_max, longitude>=lon_min & longitude<=lon_max)
+rast_mean_2402_r <- rast_mean_2402 %>%
+  filter(latitude>=lat_min & latitude<=lat_max, longitude>=lon_min & longitude<=lon_max)
+
+```
+
+### 4.2.1 Two-sample t test
+```{r}
+# define the fuction for t-test
+t_test_2df <- function(df1, df2) {
+  ttest_results <- data.frame(mean_df1 = numeric(ncol(df1)-3),
+                              mean_df2 = numeric(ncol(df2)-3),
+                              p_value = numeric(ncol(df1)-3),
+                              row.names = names(df1)[3:(ncol(df1)-1)])
+  for (i in 3:(ncol(df1)-1)) {
+    ttest <- t.test(df1[[i]], df2[[i]])
+    ttest_results[i-2, "mean_df1"] <- round(mean(df1[[i]]),digits=4)
+    ttest_results[i-2, "mean_df2"] <- round(mean(df2[[i]]), digits=4)
+    ttest_results[i-2, "p_value"] <- round(ttest$p.value, digits=4)
+  }
+  return(ttest_results)
+}
+
+# t test
+t.test_result <- t_test_2df(rast_mean_2402_r, rast_mean_2311_r)
+t.test_result %>% filter(p_value <= 0.05, mean_df1<mean_df2)
+t.test_result %>% filter(p_value <= 0.05, mean_df1>mean_df2)
+
+# From here: need to use a same lamuda for both df
+# boxcox transformation
+bc_col <- function (df, col_name) {
+  df_transformed <- df
+  # Ensure the column has only positive values
+  c=1e-10
+  df_transformed[[col_name]] <- df_transformed[[col_name]]+c
+  # Finding the optimal lambda for Box-Cox transformation
+  fit0 <- lm(as.formula(paste(col_name, "~1" )), data = df_transformed, y=TRUE)
+  bc_transform <- boxcox(object = fit0,
+                         lambda = seq(-2, 2, by = 0.1),
+                         plot = FALSE)
+  
+  lambda_opt <- bc_transform$x[which.max(bc_transform$y)]
+  print(lambda_opt)
+
+  # ifesle is not suitable here, it will only transfer the first number in the col
+  # y_transformed <- ifelse(lambda_opt == 0, log(df_transformed[[col_name]]),
+  #                        (df_transformed[[col_name]]^lambda_opt - 1) / lambda_opt)
+  if (lambda_opt == 0){
+    y_transformed <- log(df_transformed[[col_name]])
+  } else{
+    y_transformed <- (df_transformed[[col_name]]^lambda_opt - 1) / lambda_opt
+  }
+  return(y_transformed)
+  print(is.vector(y_transformed))
+}
+
+bc_col(rast_mean_2402_r,"X2.Ethyltoluene")
+
+
+```
+### 4.2.2 Wilcoxon rank sum test
+We found three related chemicals show a significant higher concentration when the factory was operating: 2-Ethytolune, Carbon Tetrachloride and trans-1,3-Dichloropropene.
+
+```{r}
+
+
+# Check normality
+## shapiro.test for all: no chemicals is normal
+normal_tests <- data.frame(matrix(ncol = length(colnames(rast_mean_2311_r)), nrow = 2))
+colnames(normal_tests) <- colnames(rast_mean_2311_r)
+
+for (i in colnames(rast_mean_2311_r)) {
+  if(length(unique(rast_mean_2402_r[[i]])) > 1) {
+    test1 <- shapiro.test(rast_mean_2402_r[[i]])
+    normal_tests[[i]][1] <- test1$p.value
+  } else {
+    normal_tests[[i]][1] <- NA  # shapiro.test() will give an errror when all 'x' values are identical
+  }
+  
+  if(length(unique(rast_mean_2311_r[[i]])) > 1) {
+    test2 <- shapiro.test(rast_mean_2311_r[[i]])
+    normal_tests[[i]][2] <- test2$p.value
+  } else {
+    normal_tests[[i]][2] <- NA
+  }
+}
+normal_tests
+
+## Check normality by plotting
+ggdensity(rast_mean_2311_r$P.Xylene)
+ggqqplot(rast_mean_2311_r$P.Xylene)
+
+
+# Define the fuction to get the median, range, wilcox test result,etc.
+wilcox_2df <- function(df1, df2) {
+  wilcox_results <- data.frame(median_df1 = numeric(ncol(df1)-2),
+                              min_df1 = numeric(ncol(df1)-2),
+                              max_df1 = numeric(ncol(df1)-2),
+                              median_df2 = numeric(ncol(df2)-2),
+                              min_df2 = numeric(ncol(df2)-2),
+                              max_df2 = numeric(ncol(df2)-2),                              
+                              p_value = numeric(ncol(df2)-2),
+                              row.names = names(df1)[3:ncol(df1)])
+  for (i in 3:ncol(df1)) {
+    wil.test <- wilcox.test(df1[[i]], df2[[i]])
+    wilcox_results[i-2, "median_df1"] <- round(median(df1[[i]]),digits=3)
+    wilcox_results[i-2, "median_df2"] <- round(median(df2[[i]]), digits=3)
+    wilcox_results[i-2, "min_df1"] <- round(min(df1[[i]]),digits=3)
+    wilcox_results[i-2, "max_df1"] <- round(max(df1[[i]]), digits=3)
+    wilcox_results[i-2, "min_df2"] <- round(min(df2[[i]]),digits=3)
+    wilcox_results[i-2, "max_df2"] <- round(max(df2[[i]]), digits=3)
+    wilcox_results[i-2, "p_value"] <- round(wil.test$p.value, digits=4)
+  }
+  return(wilcox_results)
+}
+
+wilcox_results <- wilcox_2df(rast_mean_2402_r,rast_mean_2311_r)
+
+# Chemicals with higher concentration when operating
+wilcox_results %>% filter(p_value <= 0.05 & median_df1 < median_df2)
+# Chemicals with higher concentration when not operating
+wilcox_results %>% filter(p_value <= 0.05 & median_df1 > median_df2)
+```
+### 4.2.2 Ploting for comparison
+In part 3, I showed how to plot the rasterized means of the 2402 data set (when not operating). To compare the operating and not operating plots side by side, we need to ensure the legend of a same chemical use the same scale.
+
+```{r}
+# 1. get a more accurate ggmap
+# library(ggmap)
+# library(rstudioapi)
+# register_google(key="********************")
+# MAT_as.15u <- ggmap (get_googlemap(center=c(lon=-87.676, lat=41.825),
+#                                zoom = 15,
+#                                maptype = 'terrain',
+#                                color = 'color'))
+# save(MAT_as.15u, file = "MAT_as.15u.RData")
+load("MAT_as.15u.RData")
+
+# 2. Plot 2311 data and 2402 data with a consistent color scale for each chemical
+
+# Function to find global min and max for each measure
+find_global_min_max <- function(col_name) {
+  global_min <- min(c(min(rast_mean_2402_r[[col_name]], na.rm = TRUE), min(rast_mean_2311_r[[col_name]], na.rm = TRUE)))
+  global_max <- max(c(max(rast_mean_2402_r[[col_name]], na.rm = TRUE), max(rast_mean_2311_r[[col_name]], na.rm = TRUE)))
+  return(list(min = global_min, max = global_max))
+}
+
+
+# Function to plot a given measure
+plot_measure <- function(rast_mean_df, col_name, global_min, global_max, title) {
+  plot <- MAT_as.15u +
+    geom_tile(data = rast_mean_df, aes(x = longitude, y = latitude, fill = .data[[col_name]]), alpha = 0.9) +
+    scale_fill_gradientn(colors = mypal1, name = col_name, limits = c(global_min, global_max)) +
+    coord_sf(xlim = c(lon_min - 0.002, lon_max + 0.002), ylim = c(lat_min - 0.002, lat_max + 0.002)) +
+    ggtitle(title)
+  return(plot)
+}
+
+# An example 
+min_max <- find_global_min_max("trans.1.3.Dichloropropene")
+plot_measure(rast_mean_2402_r, "trans.1.3.Dichloropropene", min_max$min, min_max$max, "Not Operating")
+plot_measure(rast_mean_2311_r, "trans.1.3.Dichloropropene", min_max$min, min_max$max, "Operating")
+
+
+# Plot all the chemicals
+# output_dir <- "./23113vs2402_MAT_plots"
+# # Check if the output directory exists, if not, create it
+# if (!dir.exists(output_dir)) {
+#   dir.create(output_dir, recursive = TRUE)
+# }
+# 
+# plot_list <- list()
+# for (col_name in colnames(rast_mean_2402_r)[3:ncol(rast_mean_2402_r)]) {
+#   # Find global min and max values for the current measure
+#   min_max <- find_global_min_max(col_name)
+#   
+#   # Plot for rast_mean_2402 dataset
+#   plot_name1 <- paste0(col_name, "_2402")
+#   plot_list[[plot_name1]] <- plot_measure(rast_mean_2402_r, col_name, min_max$min, min_max$max, paste("When Factory Not Operating -", col_name))
+#   
+#   # Plot for rast_mean_2311 dataset
+#   plot_name2 <- paste0(col_name, "_2311")
+#   plot_list[[plot_name2]] <- plot_measure(rast_mean_2311_r, col_name, min_max$min, min_max$max, paste("When Factory Operating -", col_name))
+#   
+#   # Save plot1
+#   file_path1 <- paste0(output_dir, "/", plot_name1, ".png")
+#   png(filename = file_path1, width = 1200, height = 900, res = 150) 
+#   print(plot_list[[plot_name1]])
+#   dev.off()
+#   
+#   # Save plot2
+#   file_path2 <- paste0(output_dir, "/", plot_name2, ".png")
+#   png(filename = file_path2, width = 1200, height = 900, res = 150) 
+#   print(plot_list[[plot_name2]])
+#   dev.off()
+# }
+
+```
+
+
+## 4.3 Compare the downstream and upstream data
+If the presence of a chemical is primarily linked to emissions from the asphalt factory rather than the railway or other nearby factories, we would expect to see a discernible pattern in its distribution. Specifically, higher concentrations of the chemical would be expected downstream of the wind relative to upstream locations. Furthermore, within the downstream area, the concentration of the chemical is likely to diminish as the distance from the factory increases.
+### 4.3.1 Compare the downstream and upstream data
+On November 30, 2023, the wind was blowing from the Southwest, so I compare the data taken in northwest to the factory with other direction.
+```{r}
+
+#1. calculate the distance between each data points and the factory
+rast_mean_2311_d <- rast_mean_2311
+rast_mean_2311_d$Distance <- NA
+
+loc_MAT <- c(-87.67708,41.82294)
+rast_mean_2311_d <- rast_mean_2311_d %>%
+  rowwise() %>%
+  mutate(Distance= distm(c(longitude,latitude), loc_MAT, fun = distHaversine)) %>%
+  ungroup()
+
+# Divide rast_mean_2311_d into 4 parts in terms its relative location to the factory
+rast_mean_2311_sw <- rast_mean_2311_d %>%
+  filter(longitude<=loc_MAT[1],latitude<=loc_MAT[2]) 
+rast_mean_2311_nw <- rast_mean_2311_d %>%
+  filter(longitude<=loc_MAT[1],latitude>loc_MAT[2])  
+rast_mean_2311_ne <- rast_mean_2311_d %>%
+  filter(longitude>loc_MAT[1],latitude>loc_MAT[2])  
+rast_mean_2311_se <- rast_mean_2311_d %>%
+  filter(longitude>loc_MAT[1],latitude<=loc_MAT[2])  
+
+rast_mean_2311_m.ne <- rbind(rast_mean_2311_nw,rast_mean_2311_sw,rast_mean_2311_se)
+
+# 2. wilcox test
+wilcox_2df.2 <- function(df1, df2) {
+  wilcox_results <- data.frame(median_df1 = numeric(ncol(df1)-3),
+                              min_df1 = numeric(ncol(df1)-3),
+                              max_df1 = numeric(ncol(df1)-3),
+                              median_df2 = numeric(ncol(df2)-3),
+                              min_df2 = numeric(ncol(df2)-3),
+                              max_df2 = numeric(ncol(df2)-3),                              
+                              p_value = numeric(ncol(df2)-3),
+                              row.names = names(df1)[3:(ncol(df1)-1)])
+  for (i in 3:(ncol(df1)-1)) {
+    wil.test <- wilcox.test(df1[[i]], df2[[i]])
+    wilcox_results[i-2, "median_df1"] <- round(median(df1[[i]]),digits=3)
+    wilcox_results[i-2, "median_df2"] <- round(median(df2[[i]]), digits=3)
+    wilcox_results[i-2, "min_df1"] <- round(min(df1[[i]]),digits=3)
+    wilcox_results[i-2, "max_df1"] <- round(max(df1[[i]]), digits=3)
+    wilcox_results[i-2, "min_df2"] <- round(min(df2[[i]]),digits=3)
+    wilcox_results[i-2, "max_df2"] <- round(max(df2[[i]]), digits=3)
+    wilcox_results[i-2, "p_value"] <- round(wil.test$p.value, digits=4)
+  }
+  return(wilcox_results)
+}
+
+wilcox_results_wind <- wilcox_2df.2(rast_mean_2311_m.ne,rast_mean_2311_ne)
+
+# There were higher O.Xylene, Phenol, X2.Ethyltoluene, X4.Ethyltoluene, Ethylbenzene, Carbon.Tetrachloride, and trans.1.3.Dichloropropene in the downstream.
+wilcox_results_wind %>% 
+  select(median_df1,median_df2,p_value) %>%
+  filter(median_df1<median_df2)
+
+#  Only Ethylbenzene is significant higher in the downstream.
+wilcox_results_wind %>% 
+  select(median_df1,median_df2,p_value) %>%
+  filter(p_value<=0.05)
+
+```
+### 4.3.2 Linear regression
+To evaluate if there's a linear correlation between the factory's distance and the chemical concentration levels, I conducted a simple linear regression focusing for all the chemicals with higher median concentrations to the northeast of the factory, but non of them looks good. Take Carbon Tetrachloride as an example: the model explain less than 1% of the variation with high P-value; the standardized residuals are not normally distributed and there are a few outliers.
+```{r}
+
+# 1. Creat a function for linear regression
+diag_lm <- function(df, col_name) {
+  formula_str <- paste(col_name, "~ Distance")
+  fit <- lm(as.formula(formula_str), data = df)
+  summary_fit <- summary(fit)
+  # residual plots
+  par(mfrow = c(2, 2))
+  plot(fit)
+}
+diag_lm(rast_mean_2311_ne, "Carbon.Tetrachloride")
+
+
+# Linear regression for all the chemicals that has a higher median in the ne (downstream)
+#  All the linear regression model shows low R-squared and high p-value of F-test
+# higher_in_ne <- c("O.Xylene", "Phenol", "X2.Ethyltoluene", "4","X4.Ethyltoluene", "Ethylbenzene", "Carbon.Tetrachloride", "trans.1.3.Dichloropropene")
+# lm_plots <- list()
+# for (i in higher_in_ne) {
+#   lm.plot <- tryCatch({
+#     diag_lm(rast_mean_2311_ne, i)
+#   }, error = function(e) {
+#     warning(paste("An error occurred with chemical:", i, "Error:", e$message))
+#     NULL # to ensure the loop will continue when error occurs
+#   })
+#   print(lm.plot)
+#   lm_plots[[i]] <- lm.plot
+# }
+
+
+# 2. Creat a function for a nicer linear regression plot
+plot_lm <- function(df, col_name) {
+  formula_str <- paste(col_name, "~ Distance")
+  fit <- lm(as.formula(formula_str), data = df)
+  summary_fit <- summary(fit)
+
+  # Extracting model summary details
+  adj_r_squared <- round(summary_fit$adj.r.squared, 4)
+  intercept <- round(fit$coefficients[1], 3)
+  slope <- round(fit$coefficients[2], 3)
+  p_value <- round(summary_fit$coefficients["Distance", "Pr(>|t|)"], 4)
+  # Creating the plot
+  ggplot(df, aes(x = "Distance", y = .data[[col_name]])) + # or use y = !!sym(col_name)
+    geom_point() +
+    geom_smooth(method = "lm", color = mypal1[18]) +
+    labs(
+      title = paste("Linear Regression of", col_name, "by Distance"),
+      subtitle = paste("Adj R² =", adj_r_squared,
+                       "| Intercept =", intercept,
+                       "| Slope =", slope,
+                       "| p-value =", p_value),
+      x = "Distance",
+      y = col_name
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 14, face = "bold"),
+      plot.subtitle = element_text(size = 12)
+    )
+}
+plot_lm(rast_mean_2311_ne, "Carbon.Tetrachloride")
+
+
+```
